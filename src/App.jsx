@@ -20,9 +20,17 @@ function App() {
           <Route path="/login" element={<Login />} />
           <Route path="/register" element={<Register />} />
 
-          {/* Protected route */}
+          {/* Protected routes */}
           <Route
             path="/"
+            element={
+              <ProtectedRoute>
+                <Chat />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/chat/:chatId"
             element={
               <ProtectedRoute>
                 <Chat />

@@ -1,11 +1,12 @@
 import { useState, useContext } from "react";
-import { useNavigate, Link } from "react-router-dom";
+import { useNavigate, Link, useLocation } from "react-router-dom";
 import { AuthContext } from "../context/AuthContext";
 import API from "../api/axios";
 
 export default function Login() {
   const { setUser } = useContext(AuthContext);
   const navigate = useNavigate();
+  const location = useLocation();
 
   const [data, setData] = useState({ email: "", password: "" });
   const [error, setError] = useState("");
@@ -27,7 +28,14 @@ export default function Login() {
 
       localStorage.setItem("token", token);
       setUser(user);
-      navigate("/");
+      
+      // Redirect to the page they were trying to visit (with search params)
+      const from = location.state?.from;
+      if (from) {
+        navigate(from.pathname + from.search);
+      } else {
+        navigate("/");
+      }
     } catch (err) {
       const msg = err.response?.data?.message || "Login failed";
       setError(msg);

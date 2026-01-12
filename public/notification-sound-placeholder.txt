@@ -1,0 +1,2 @@
+<!-- This is a placeholder - In production, add a real notification sound file -->
+<!-- notification.mp3 or notification.wav should be placed here -->

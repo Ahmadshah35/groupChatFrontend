@@ -1,4 +1,5 @@
 import { useContext, useEffect, useState, useRef } from "react";
+import { useSearchParams } from "react-router-dom";
 import { AuthContext } from "../context/AuthContext";
 import { io } from "socket.io-client";
 import API from "../api/axios";
@@ -8,9 +9,11 @@ import { IoMdSend } from "react-icons/io";
 import { MdGroup, MdPersonAdd } from "react-icons/md";
 import { FaUserCircle } from "react-icons/fa";
 import CreateGroupModal from "../components/CreateGroupModal";
+import NotificationToast from "../components/NotificationToast";
 
 export default function Chat() {
   const { user } = useContext(AuthContext);
+  const [searchParams, setSearchParams] = useSearchParams();
   const [users, setUsers] = useState([]);
   const [groups, setGroups] = useState([]);
   const [onlineUsers, setOnlineUsers] = useState([]);
@@ -24,6 +27,7 @@ export default function Chat() {
   const [page, setPage] = useState(1);
   const [hasMore, setHasMore] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [notification, setNotification] = useState(null);
   const messagesEndRef = useRef(null);
   const messagesContainerRef = useRef(null);
   const typingTimeoutRef = useRef(null);
@@ -32,10 +36,38 @@ export default function Chat() {
   const messageCounterRef = useRef(0);
   const isLoadingMoreRef = useRef(false);
   const pendingMessagesRef = useRef({}); // Store messages for inactive chats
+  const notificationAudioRef = useRef(null);
+
+  // Initialize notification audio
+  useEffect(() => {
+    notificationAudioRef.current = new Audio("data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdJivrJBhNjVgodDbq2EcBj+a2/LDciUFLIHO8tiJNwgZaLvt559NEAxQp+PwtmMcBjiR1/LMeSwFJHfH8N2QQAoUXrTp66hVFApGn+DyvmwhBSuBzvLZiTYHGGS87+mgWBALVKXh8bllHAU2jdXwz3csB");
+  }, []);
+
+  // Request notification permission on mount
+  useEffect(() => {
+    if ("Notification" in window && Notification.permission === "default") {
+      Notification.requestPermission();
+    }
+  }, []);
 
   // Keep selectedChatRef in sync with selectedChat
   useEffect(() => {
     selectedChatRef.current = selectedChat;
+    
+    // Emit chatOpened when selectedChat changes and socket is connected
+    if (selectedChat && socketRef.current?.connected) {
+      socketRef.current.emit("chatOpened", { 
+        chatId: selectedChat._id, 
+        isGroup: selectedChat.isGroup || false
+      });
+    }
+    
+    // Cleanup: emit chatClosed when chat changes or component unmounts
+    return () => {
+      if (socketRef.current?.connected) {
+        socketRef.current.emit("chatClosed");
+      }
+    };
   }, [selectedChat]);
 
   // Scroll to bottom when messages change (but not when loading more)
@@ -210,6 +242,63 @@ export default function Chat() {
         setIsTyping(isTyping ? senderName : false);
       }
     });
+
+    // Handle incoming notification
+    socket.on("newMessageNotification", (notificationData) => {
+      console.log("🔔 Received notification:", notificationData);
+      const currentChat = selectedChatRef.current;
+      
+      // Only show notification if chat is not currently open or window is not focused
+      const shouldShowNotification = 
+        !currentChat || 
+        (notificationData.type === "direct" && currentChat._id !== notificationData.chatId) ||
+        (notificationData.type === "group" && currentChat._id !== notificationData.chatId) ||
+        document.hidden;
+      
+      if (shouldShowNotification) {
+        // Show in-app notification
+        setNotification(notificationData);
+        
+        // Play notification sound
+        if (notificationAudioRef.current) {
+          notificationAudioRef.current.play().catch(err => 
+            console.log("Audio play failed:", err)
+          );
+        }
+        
+        // Show browser notification if permission granted and window not focused
+        if (document.hidden && "Notification" in window && Notification.permission === "granted") {
+          const title = notificationData.type === "group" 
+            ? `${notificationData.groupName}` 
+            : notificationData.senderName;
+          
+          const body = notificationData.type === "group"
+            ? `${notificationData.senderName}: ${notificationData.message}`
+            : notificationData.message;
+          
+          const browserNotification = new Notification(title, {
+            body: body,
+            icon: "/icon.png", // Add your app icon
+            badge: "/badge.png",
+            tag: notificationData.chatId,
+            requireInteraction: false
+          });
+          
+          browserNotification.onclick = () => {
+            window.focus();
+            browserNotification.close();
+            // Optionally open the chat
+            if (notificationData.type === "direct") {
+              const userToSelect = users.find(u => u._id === notificationData.senderId);
+              if (userToSelect) setSelectedChat(userToSelect);
+            } else {
+              const groupToSelect = groups.find(g => g._id === notificationData.chatId);
+              if (groupToSelect) setSelectedChat(groupToSelect);
+            }
+          };
+        }
+      }
+    });
     
     socket.on("messageStatusUpdate", ({ messageId, status, deliveredTo, readBy }) => {
       setMessages((prev) => prev.map((msg) => (msg._id === messageId ? { ...msg, status, deliveredTo, readBy } : msg)));
@@ -263,6 +352,7 @@ export default function Chat() {
       socket.off("removedFromGroup");
       socket.disconnect();
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user]);
 
   useEffect(() => {
@@ -270,6 +360,66 @@ export default function Chat() {
     API.get("/auth/users").then((res) => setUsers(res.data || [])).catch((err) => console.error("Error fetching users:", err));
     API.get("/group").then((res) => setGroups(res.data || [])).catch((err) => console.error("Error fetching groups:", err));
   }, [user]);
+
+  // Handle notification clicks - open chat from URL params or service worker message
+  useEffect(() => {
+    if (!user || !users.length || !groups.length) {
+      console.log("⏳ Waiting for user data to load...", { user: !!user, usersCount: users.length, groupsCount: groups.length });
+      return;
+    }
+
+    // Handle URL parameters (from notification click)
+    const openChatParam = searchParams.get("openChat");
+    const typeParam = searchParams.get("type");
+    
+    if (openChatParam) {
+      console.log("📱 Opening chat from notification URL:", openChatParam, typeParam);
+      
+      if (typeParam === "group") {
+        const group = groups.find(g => g._id === openChatParam);
+        console.log("🔍 Looking for group:", openChatParam, "Found:", !!group);
+        if (group) {
+          console.log("✅ Opening group chat:", group.name);
+          openChat(group, true);
+          // Clear URL params after a short delay to prevent re-triggering
+          setTimeout(() => setSearchParams({}), 100);
+        } else {
+          console.error("❌ Group not found:", openChatParam);
+        }
+      } else {
+        const userToOpen = users.find(u => u._id === openChatParam);
+        console.log("🔍 Looking for user:", openChatParam, "Found:", !!userToOpen);
+        if (userToOpen) {
+          console.log("✅ Opening direct chat with:", userToOpen.name);
+          openChat(userToOpen, false);
+          // Clear URL params after a short delay to prevent re-triggering
+          setTimeout(() => setSearchParams({}), 100);
+        } else {
+          console.error("❌ User not found:", openChatParam);
+        }
+      }
+    }
+
+    // Handle service worker messages (when app is already open)
+    const handleServiceWorkerMessage = (event) => {
+      if (event.data?.action === "openChat") {
+        const { chatId, type } = event.data;
+        console.log("📱 Opening chat from service worker message:", chatId, type);
+        
+        // Use URL parameters approach for consistency and to handle race conditions
+        // This ensures the chat opens even if users/groups aren't loaded yet
+        console.log("🔗 Setting search params to trigger chat opening");
+        setSearchParams({ openChat: chatId, type: type || "direct" });
+      }
+    };
+
+    navigator.serviceWorker?.addEventListener("message", handleServiceWorkerMessage);
+
+    return () => {
+      navigator.serviceWorker?.removeEventListener("message", handleServiceWorkerMessage);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user, users, groups, searchParams]);
 
   useEffect(() => {
     if (selectedChat && messages.length > 0 && socketRef.current) {
@@ -497,8 +647,31 @@ export default function Chat() {
 
   if (!user) return <div>Loading...</div>;
 
+  // Handle notification click
+  const handleNotificationClick = () => {
+    if (notification) {
+      if (notification.type === "direct") {
+        const userToSelect = users.find(u => u._id === notification.senderId);
+        if (userToSelect) setSelectedChat(userToSelect);
+      } else {
+        const groupToSelect = groups.find(g => g._id === notification.chatId);
+        if (groupToSelect) setSelectedChat(groupToSelect);
+      }
+      setNotification(null);
+    }
+  };
+
   return (
     <div className="h-screen flex bg-gray-100">
+      {/* Notification Toast */}
+      {notification && (
+        <NotificationToast
+          notification={notification}
+          onClose={() => setNotification(null)}
+          onClick={handleNotificationClick}
+        />
+      )}
+
       <div className="w-1/3 bg-white border-r flex flex-col">
         <div className="p-4 bg-green-600 border-b flex items-center justify-between">
           <div className="flex items-center">
