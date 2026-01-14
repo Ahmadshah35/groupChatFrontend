@@ -4,7 +4,7 @@ import { AuthContext } from "../context/AuthContext";
 import { io } from "socket.io-client";
 import API from "../api/axios";
 import { formatDistanceToNow, format } from "date-fns";
-import { BsThreeDotsVertical } from "react-icons/bs";
+import { BsThreeDotsVertical, BsCheck, BsCheckAll } from "react-icons/bs";
 import { IoMdSend } from "react-icons/io";
 import { MdGroup, MdPersonAdd } from "react-icons/md";
 import { FaUserCircle } from "react-icons/fa";
@@ -21,8 +21,22 @@ export default function Chat() {
   const [messages, setMessages] = useState([]);
   const [text, setText] = useState("");
   const [typing, setTyping] = useState(false);
-  const [isTyping, setIsTyping] = useState(false);
+  const [isTyping, setIsTyping] = useState(null); // Store typing user info: { name, profileImage, userId }
   const [showCreateGroup, setShowCreateGroup] = useState(false);
+
+  // Debug: Log groups changes
+  useEffect(() => {
+    console.log("📊 Groups state updated. Count:", groups.length);
+    if (groups.length > 0) {
+      console.log("📋 Group IDs:", groups.map(g => `${g.name} (${g._id})`));
+      // Check for duplicates
+      const ids = groups.map(g => g._id);
+      const duplicates = ids.filter((id, index) => ids.indexOf(id) !== index);
+      if (duplicates.length > 0) {
+        console.error("🚨 DUPLICATE GROUPS FOUND:", duplicates);
+      }
+    }
+  }, [groups]);
   const [chatType, setChatType] = useState("users");
   const [page, setPage] = useState(1);
   const [hasMore, setHasMore] = useState(false);
@@ -236,10 +250,20 @@ export default function Chat() {
       }
     });
     
-    socket.on("groupTyping", ({ groupId, senderId, senderName, isTyping }) => {
+    socket.on("groupTyping", ({ groupId, senderId, senderName, isTyping: typing }) => {
       const currentChat = selectedChatRef.current;
       if (currentChat && currentChat.isGroup && groupId === currentChat._id && senderId !== user._id) {
-        setIsTyping(isTyping ? senderName : false);
+        if (typing) {
+          // Find the typing user's full info from group members
+          const typingUser = currentChat.members?.find(m => m._id === senderId);
+          setIsTyping({
+            name: senderName,
+            profileImage: typingUser?.profileImage,
+            userId: senderId
+          });
+        } else {
+          setIsTyping(null);
+        }
       }
     });
 
@@ -301,7 +325,18 @@ export default function Chat() {
     });
     
     socket.on("messageStatusUpdate", ({ messageId, status, deliveredTo, readBy }) => {
-      setMessages((prev) => prev.map((msg) => (msg._id === messageId ? { ...msg, status, deliveredTo, readBy } : msg)));
+      console.log("📊 Message status update:", { messageId, status, deliveredCount: deliveredTo?.length, readCount: readBy?.length });
+      setMessages((prev) => prev.map((msg) => {
+        if (msg._id === messageId) {
+          return { 
+            ...msg, 
+            status: status || msg.status,
+            deliveredTo: deliveredTo || msg.deliveredTo || [],
+            readBy: readBy || msg.readBy || []
+          };
+        }
+        return msg;
+      }));
     });
     
     socket.on("newUser", (newUser) => {
@@ -319,7 +354,11 @@ export default function Chat() {
       setGroups((prev) => {
         // Check if group already exists
         const exists = prev.some(g => g._id === group._id);
-        if (exists) return prev;
+        if (exists) {
+          console.log("⚠️ Group already exists in state, skipping:", group._id);
+          return prev;
+        }
+        console.log("✅ Adding new group to state:", group.name);
         return [group, ...prev];
       });
     });
@@ -432,7 +471,6 @@ export default function Chat() {
   }, [selectedChat, messages, user]);
 
   const openChat = async (chat, isGroup = false) => {
-    setSelectedChat({ ...chat, isGroup });
     setMessages([]);
     setPage(1);
     setLoading(true);
@@ -441,6 +479,23 @@ export default function Chat() {
     const chatKey = isGroup ? `group_${chat._id}` : `direct_${chat._id}`;
     
     try {
+      // For groups, fetch full group details with populated members first
+      let chatWithDetails = chat;
+      if (isGroup) {
+        try {
+          const groupDetailsRes = await API.get(`/group/${chat._id}`);
+          chatWithDetails = { ...groupDetailsRes.data, isGroup: true };
+        } catch (err) {
+          console.error("Error fetching group details:", err);
+          // Continue with existing chat data if details fetch fails
+          chatWithDetails = { ...chat, isGroup };
+        }
+      } else {
+        chatWithDetails = { ...chat, isGroup };
+      }
+      
+      setSelectedChat(chatWithDetails);
+      
       // Load first page immediately
       const res = await API.get(isGroup
         ? `/group/${chat._id}/messages?page=1&limit=50`
@@ -645,6 +700,40 @@ export default function Chat() {
   const getProfileImage = (user) => user.profileImage ? `https://chat.apiforapp.link/api/${user.profileImage}` : null;
   // const getProfileImage = (user) => user.profileImage ? `http://localhost:2000/api/${user.profileImage}` : null;
 
+  // Get message status icon
+  const getStatusIcon = (message) => {
+    if (!message || message.senderId !== user._id && message.senderId?._id !== user._id) {
+      return null; // Don't show status for received messages
+    }
+
+    if (selectedChat?.isGroup) {
+      // Group message status
+      const totalMembers = selectedChat.members?.length - 1 || 0; // Exclude sender
+      const deliveredCount = message.deliveredTo?.length || 0;
+      const readCount = message.readBy?.length || 0;
+
+      if (readCount > 0) {
+        // At least one person read it - blue double check
+        return <BsCheckAll className="inline ml-1" size={14} style={{ color: '#4fc3f7' }} title={`Read by ${readCount}/${totalMembers}`} />;
+      } else if (deliveredCount > 0) {
+        // At least one person received it - grey double check
+        return <BsCheckAll className="inline ml-1" size={14} style={{ color: '#95a5a6' }} title={`Delivered to ${deliveredCount}/${totalMembers}`} />;
+      } else {
+        // Sent but not delivered yet - single grey check
+        return <BsCheck className="inline ml-1" size={14} style={{ color: '#95a5a6' }} title="Sent" />;
+      }
+    } else {
+      // Direct message status
+      if (message.status === 'read') {
+        return <BsCheckAll className="inline ml-1" size={14} style={{ color: '#4fc3f7' }} title="Read" />;
+      } else if (message.status === 'delivered') {
+        return <BsCheckAll className="inline ml-1" size={14} style={{ color: '#95a5a6' }} title="Delivered" />;
+      } else {
+        return <BsCheck className="inline ml-1" size={14} style={{ color: '#95a5a6' }} title="Sent" />;
+      }
+    }
+  };
+
   if (!user) return <div>Loading...</div>;
 
   // Handle notification click
@@ -652,10 +741,10 @@ export default function Chat() {
     if (notification) {
       if (notification.type === "direct") {
         const userToSelect = users.find(u => u._id === notification.senderId);
-        if (userToSelect) setSelectedChat(userToSelect);
+        if (userToSelect) openChat(userToSelect, false);
       } else {
         const groupToSelect = groups.find(g => g._id === notification.chatId);
-        if (groupToSelect) setSelectedChat(groupToSelect);
+        if (groupToSelect) openChat(groupToSelect, true);
       }
       setNotification(null);
     }
@@ -758,7 +847,14 @@ export default function Chat() {
                   <div className="font-bold">{selectedChat.name}</div>
                   <div className="text-xs text-green-100">
                     {isTyping ? (
-                      <span className="italic">{typeof isTyping === "string" ? `${isTyping} typing...` : "typing..."}</span>
+                      <span className="italic flex items-center gap-1">
+                        {isTyping.name ? `${isTyping.name} ` : ""}typing
+                        <span className="flex gap-[2px]">
+                          <span className="w-1 h-1 bg-green-100 rounded-full animate-bounce" style={{ animationDelay: '0ms' }}></span>
+                          <span className="w-1 h-1 bg-green-100 rounded-full animate-bounce" style={{ animationDelay: '150ms' }}></span>
+                          <span className="w-1 h-1 bg-green-100 rounded-full animate-bounce" style={{ animationDelay: '300ms' }}></span>
+                        </span>
+                      </span>
                     ) : selectedChat.isGroup ? (
                       `${selectedChat.members?.length || 0} members`
                     ) : onlineUsers?.includes(selectedChat._id) ? (
@@ -814,13 +910,52 @@ export default function Chat() {
                         <div className="text-xs font-semibold text-green-600 mb-1">{senderInfo?.name || "Unknown"}</div>
                       )}
                       <div className="break-words">{m.message}</div>
-                      <div className="text-xs text-gray-500 mt-1 text-right">
-                        {m.createdAt ? format(new Date(m.createdAt), 'h:mm a') : ''}
+                      <div className="text-xs text-gray-500 mt-1 text-right flex items-center justify-end">
+                        <span>{m.createdAt ? format(new Date(m.createdAt), 'h:mm a') : ''}</span>
+                        {isSentByMe && getStatusIcon(m)}
                       </div>
                     </div>
                   </div>
                 );
               })}
+              
+              {/* Typing indicator bubble */}
+              {isTyping && (
+                <div className="mb-2 flex items-end justify-start">
+                  {selectedChat.isGroup && isTyping.name && (
+                    <div className="mr-2 flex-shrink-0">
+                      {isTyping.profileImage ? (
+                        <>
+                          <img 
+                            src={`https://chat.apiforapp.link/api/${isTyping.profileImage}`}
+                            alt={isTyping.name}
+                            className="w-8 h-8 rounded-full object-cover"
+                            onError={(e) => {
+                              e.target.style.display = 'none';
+                              e.target.nextSibling.style.display = 'flex';
+                            }}
+                          />
+                          <div className="w-8 h-8 rounded-full bg-gray-400 text-white items-center justify-center text-xs font-bold hidden">
+                            {isTyping.name?.[0]?.toUpperCase() || "?"}
+                          </div>
+                        </>
+                      ) : (
+                        <div className="w-8 h-8 rounded-full bg-gray-400 text-white flex items-center justify-center text-xs font-bold">
+                          {isTyping.name?.[0]?.toUpperCase() || "?"}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                  <div className="max-w-xs lg:max-w-md px-4 py-3 rounded-lg shadow bg-white">
+                    <div className="flex gap-1 items-center">
+                      <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '0ms' }}></span>
+                      <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }}></span>
+                      <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }}></span>
+                    </div>
+                  </div>
+                </div>
+              )}
+              
               <div ref={messagesEndRef}></div>
             </div>
             <div className="p-3 flex items-center border-t bg-white">
@@ -850,7 +985,15 @@ export default function Chat() {
         )}
       </div>
       {showCreateGroup && (
-        <CreateGroupModal users={users} onClose={() => setShowCreateGroup(false)} onGroupCreated={(group) => { setGroups((prev) => [group, ...prev]); setShowCreateGroup(false); }} />
+        <CreateGroupModal 
+          users={users} 
+          onClose={() => setShowCreateGroup(false)} 
+          onGroupCreated={() => { 
+            // Don't add group here - let the socket 'newGroup' event handle it
+            // This prevents duplicate groups in state
+            setShowCreateGroup(false); 
+          }} 
+        />
       )}
     </div>
   );
